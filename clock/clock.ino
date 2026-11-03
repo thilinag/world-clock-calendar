@@ -1,7 +1,11 @@
 /*
- * World Clock — 4 timezones + "compare a time" slider
- * Board : Waveshare ESP32-S3-Touch-AMOLED-2.16 (CO5300 480x480 QSPI, CST9220 touch, PCF85063 RTC)
- * Stack : LVGL 8.4 + Arduino_GFX 1.6.4 + SensorLib 0.3.3 (Waveshare bundled versions)
+ * World Clock + Google Calendar "next event"
+ * Board : Waveshare ESP32-S3-Touch-AMOLED-2.16 (CO5300 480x480 QSPI, CST9220 touch, PCF85063 RTC, ES8311 audio)
+ * Stack : LVGL 8.4 + Arduino_GFX 1.6.4 + SensorLib 0.3.3 (Waveshare bundled versions) + ArduinoJson 7
+ *
+ * Page 1: 4 timezones + "compare a time" slider.   Swipe left ->
+ * Page 2: next Google Calendar event. One minute before it starts the device chimes and
+ *         shows a full-screen red seconds countdown, then returns to page 2.
  *
  * Time source: NTP over WiFi when available; the UTC time is saved to the PCF85063 RTC,
  * so the clock keeps working after a reboot without WiFi.
@@ -17,27 +21,16 @@
 #include "pin_config.h"
 #include "TouchDrvCSTXXX.hpp"
 #include "SensorPCF85063.hpp"
+#include "time_utils.h"
+#include "ui_common.h"
+#include "google_calendar.h"
+#include "calendar_page.h"
+#include "alert_audio.h"
 
 // ---------------------------------------------------------------- user config
-#include "secrets.h"   // WiFi credentials (copy secrets.example.h -> secrets.h)
+#include "secrets.h"   // WiFi + Google credentials (copy secrets.example.h -> secrets.h)
 static const char *WIFI_SSID = WIFI_SSID_VALUE;
 static const char *WIFI_PASS = WIFI_PASS_VALUE;
-
-// Daylight-saving rule sets (computed in the sketch; the C library's TZ code leaks memory)
-enum DstRule {
-  RULE_NONE,
-  RULE_AU,   // Australia (VIC/SA/NSW/TAS/ACT): 1st Sun Oct 02:00 -> 1st Sun Apr 03:00
-  RULE_US,   // USA/Canada:                     2nd Sun Mar 02:00 -> 1st Sun Nov 02:00
-};
-
-struct Zone {
-  const char *name;
-  int stdOffsetMin;      // standard-time offset from UTC in minutes
-  DstRule dst;           // +60 min while daylight saving is active
-  const char *stdAbbrev; // badge text if non-null (e.g. "PST"), otherwise "GMT+11" style
-  const char *dstAbbrev;
-  uint32_t accent;
-};
 
 static const Zone ZONES[4] = {
   { "Melbourne",   10 * 60,      RULE_AU,   nullptr, nullptr, 0xFBBF24 },
@@ -45,24 +38,16 @@ static const Zone ZONES[4] = {
   { "Adelaide",    9 * 60 + 30,  RULE_AU,   nullptr, nullptr, 0x38BDF8 },
   { "Sri Lanka",   5 * 60 + 30,  RULE_NONE, nullptr, nullptr, 0x34D399 },
 };
+static const int HOME_ZONE = 0;            // timezone used to show calendar event times
 
 static const uint32_t SCREEN_TIMEOUT_MS = 2UL * 60UL * 1000UL;  // screen off after 2 min idle
 static const uint8_t SCREEN_BRIGHTNESS = 180;
 static const int WAKE_BUTTONS[] = { 18 /* KEY3 user button */, 0 /* BOOT */ };
+static const int ALERT_LEAD_SEC = 60;      // countdown starts this many seconds before an event
+static const int PREWAKE_SEC = 5 * 60;     // screen turns on (and stays on) this long before an event
 
 static const int SLIDER_STEP_MIN = 15;                  // slider resolution
 static const int SLIDER_RANGE = 12 * 60 / SLIDER_STEP_MIN;  // +/-12h
-
-// ---------------------------------------------------------------- palette
-#define C_BG        lv_color_hex(0x020617)
-#define C_CARD      lv_color_hex(0x0F172A)
-#define C_BORDER    lv_color_hex(0x1E293B)
-#define C_TEXT      lv_color_hex(0xF1F5F9)
-#define C_MUTED     lv_color_hex(0x94A3B8)
-#define C_DIM       lv_color_hex(0x64748B)
-#define C_BADGE_TXT lv_color_hex(0xCBD5E1)
-#define C_PURPLE    lv_color_hex(0x8B5CF6)
-#define C_TRACK     lv_color_hex(0xF1F5F9)
 
 // ---------------------------------------------------------------- hardware
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(LCD_CS, LCD_SCLK, LCD_SDIO0, LCD_SDIO1, LCD_SDIO2, LCD_SDIO3);
@@ -77,6 +62,25 @@ void IRAM_ATTR onTouchIrq() { touchIrq = true; }
 volatile bool ntpSynced = false;
 void onNtpSync(struct timeval *) { ntpSynced = true; }
 
+// ---------------------------------------------------------------- UI objects
+struct CardUI {
+  lv_obj_t *time;
+  lv_obj_t *date;
+  lv_obj_t *badge;
+  lv_obj_t *badgeLabel;
+};
+static CardUI cards[4];
+static lv_obj_t *slider;
+static lv_obj_t *offsetLabel;
+static lv_obj_t *resetBtn;
+static lv_obj_t *resetLabel;
+static int sliderSteps = 0;   // offset in SLIDER_STEP_MIN units
+
+static lv_obj_t *tileview;
+static lv_obj_t *pageDots[2];
+
+static CalendarState calState;   // latest copy from the calendar task
+
 // ---------------------------------------------------------------- screen power
 static bool screenOn = true;
 static uint32_t lastActivity = 0;
@@ -87,6 +91,7 @@ static void screenWake() {
   screenOn = true;
   gfx->displayOn();
   updateClocks();                       // catch up on the time missed while off
+  calendarPageUpdate(time(nullptr), calState);
   lv_obj_invalidate(lv_scr_act());
   lv_refr_now(nullptr);                 // redraw before lighting the panel
   gfx->setBrightness(SCREEN_BRIGHTNESS);
@@ -96,6 +101,7 @@ static void screenWake() {
 static void screenSleep() {
   if (!screenOn) return;
   screenOn = false;
+  showEventsPage();                     // wake up on the default (events) page
   gfx->setBrightness(0);
   gfx->displayOff();
   Serial.println("Screen off");
@@ -120,20 +126,6 @@ static bool wakeButtonPressed() {
   }
   return pressed;
 }
-
-// ---------------------------------------------------------------- UI objects
-struct CardUI {
-  lv_obj_t *time;
-  lv_obj_t *date;
-  lv_obj_t *badge;
-  lv_obj_t *badgeLabel;
-};
-static CardUI cards[4];
-static lv_obj_t *slider;
-static lv_obj_t *offsetLabel;
-static lv_obj_t *resetBtn;
-static lv_obj_t *resetLabel;
-static int sliderSteps = 0;   // offset in SLIDER_STEP_MIN units
 
 // ---------------------------------------------------------------- LVGL glue
 static lv_disp_draw_buf_t drawBuf;
@@ -171,11 +163,7 @@ static void touchRead(lv_indev_drv_t *, lv_indev_data_t *data) {
   }
   // Ignore touches while the screen is off (so the slider can't move blind).
   if (!screenOn) pressed = false;
-  if (pressed) {                          // using the UI keeps the screen on
-    lastActivity = millis();
-    static uint32_t lastLog = 0;
-    if (millis() - lastLog > 2000) { lastLog = millis(); Serial.printf("Touch at %d,%d\n", lastX, lastY); }
-  }
+  if (pressed) lastActivity = millis();   // using the UI keeps the screen on
   data->point.x = lastX;
   data->point.y = lastY;
   data->state = pressed ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
@@ -183,67 +171,7 @@ static void touchRead(lv_indev_drv_t *, lv_indev_data_t *data) {
 
 static void lvTick(void *) { lv_tick_inc(2); }
 
-// ---------------------------------------------------------------- time helpers
-static bool timeValid() { return time(nullptr) > 1700000000; }  // after Nov 2023
-
-// Timezone maths is done here with gmtime_r() only. Switching the TZ env var
-// (setenv/tzset) several times a second leaked heap in the ESP32 C library
-// and crashed the board after ~2 minutes.
-
-// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
-static int64_t daysFromCivil(int y, int m, int d) {
-  y -= m <= 2;
-  const int64_t era = (y >= 0 ? y : y - 399) / 400;
-  const int yoe = y - era * 400;
-  const int doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-  const int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-  return era * 146097 + doe - 719468;
-}
-
-// Seconds (in the zone's standard-time scale) at which the n-th Sunday of a month hits `hour`.
-static int64_t nthSundayAt(int year, int month, int n, int hour) {
-  int64_t first = daysFromCivil(year, month, 1);
-  int dow = (int)((first + 4) % 7);            // 1970-01-01 was a Thursday; 0 = Sunday
-  int64_t day = first + (7 - dow) % 7 + 7 * (n - 1);
-  return day * 86400 + hour * 3600;
-}
-
-static bool isDst(const Zone &z, time_t utc) {
-  if (z.dst == RULE_NONE) return false;
-  int64_t ls = (int64_t)utc + z.stdOffsetMin * 60;   // local standard time
-  struct tm st;
-  time_t lsT = (time_t)ls;
-  gmtime_r(&lsT, &st);
-  int y = st.tm_year + 1900;
-  if (z.dst == RULE_AU) {
-    // starts 02:00 std; ends 03:00 daylight = 02:00 std
-    return ls >= nthSundayAt(y, 10, 1, 2) || ls < nthSundayAt(y, 4, 1, 2);
-  }
-  // RULE_US: starts 02:00 std; ends 02:00 daylight = 01:00 std
-  return ls >= nthSundayAt(y, 3, 2, 2) && ls < nthSundayAt(y, 11, 1, 1);
-}
-
-// Local time in a zone; returns the zone's current UTC offset in seconds.
-static int localTimeIn(const Zone &z, time_t utc, struct tm *out, bool *dst) {
-  *dst = isDst(z, utc);
-  int off = (z.stdOffsetMin + (*dst ? 60 : 0)) * 60;
-  time_t lt = utc + off;
-  gmtime_r(&lt, out);
-  return off;
-}
-
-static void formatGmt(int offSec, char *buf, size_t n) {
-  if (offSec == 0) { snprintf(buf, n, "GMT"); return; }
-  char sign = offSec < 0 ? '-' : '+';
-  int a = abs(offSec) / 60;
-  if (a % 60) snprintf(buf, n, "GMT%c%d:%02d", sign, a / 60, a % 60);
-  else        snprintf(buf, n, "GMT%c%d", sign, a / 60);
-}
-
-static void setTextIfChanged(lv_obj_t *label, const char *txt) {
-  if (strcmp(lv_label_get_text(label), txt) != 0) lv_label_set_text(label, txt);
-}
-
+// ---------------------------------------------------------------- RTC
 static void rtcToSystem() {
   if (!rtcOk) return;
   RTC_DateTime d = rtc.getDateTime();              // RTC holds UTC
@@ -265,11 +193,16 @@ static void systemToRtc() {
   Serial.println("RTC updated from NTP");
 }
 
-// ---------------------------------------------------------------- UI update
-static void updateClocks() {
-  static const char *DAYS[] = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
-  static const char *MONTHS[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+// ---------------------------------------------------------------- clock page
+static void formatGmt(int offSec, char *buf, size_t n) {
+  if (offSec == 0) { snprintf(buf, n, "GMT"); return; }
+  char sign = offSec < 0 ? '-' : '+';
+  int a = abs(offSec) / 60;
+  if (a % 60) snprintf(buf, n, "GMT%c%d:%02d", sign, a / 60, a % 60);
+  else        snprintf(buf, n, "GMT%c%d", sign, a / 60);
+}
 
+static void updateClocks() {
   bool valid = timeValid();
   time_t t = time(nullptr) + (time_t)sliderSteps * SLIDER_STEP_MIN * 60;
 
@@ -285,12 +218,10 @@ static void updateClocks() {
     int offSec = localTimeIn(z, t, &lt, &dst);
 
     char buf[40];
-    int h12 = lt.tm_hour % 12;
-    if (h12 == 0) h12 = 12;
-    snprintf(buf, sizeof(buf), "%d:%02d %s", h12, lt.tm_min, lt.tm_hour < 12 ? "AM" : "PM");
+    formatTime12(lt, buf, sizeof(buf));
     setTextIfChanged(cards[i].time, buf);
 
-    snprintf(buf, sizeof(buf), "%s, %s %d, %d", DAYS[lt.tm_wday], MONTHS[lt.tm_mon], lt.tm_mday, lt.tm_year + 1900);
+    snprintf(buf, sizeof(buf), "%s, %s %d, %d", DAY_NAMES[lt.tm_wday], MONTH_SHORT[lt.tm_mon], lt.tm_mday, lt.tm_year + 1900);
     setTextIfChanged(cards[i].date, buf);
 
     if (z.stdAbbrev) {
@@ -328,46 +259,18 @@ static void onReset(lv_event_t *e) {
   updateOffsetUi();
 }
 
-// ---------------------------------------------------------------- UI build
-static lv_obj_t *makePanel(lv_obj_t *parent, int x, int y, int w, int h) {
-  lv_obj_t *p = lv_obj_create(parent);
-  lv_obj_remove_style_all(p);
-  lv_obj_set_pos(p, x, y);
-  lv_obj_set_size(p, w, h);
-  lv_obj_set_style_bg_color(p, C_CARD, 0);
-  lv_obj_set_style_bg_opa(p, LV_OPA_COVER, 0);
-  lv_obj_set_style_radius(p, 18, 0);
-  lv_obj_set_style_border_color(p, C_BORDER, 0);
-  lv_obj_set_style_border_width(p, 1, 0);
-  lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
-  return p;
-}
-
-static lv_obj_t *makeLabel(lv_obj_t *parent, const lv_font_t *font, lv_color_t color, const char *txt) {
-  lv_obj_t *l = lv_label_create(parent);
-  lv_obj_set_style_text_font(l, font, 0);
-  lv_obj_set_style_text_color(l, color, 0);
-  lv_label_set_text(l, txt);
-  return l;
-}
-
-static void buildUi() {
-  lv_obj_t *scr = lv_scr_act();
-  lv_obj_set_style_bg_color(scr, C_BG, 0);
-  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
-  lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
-
+static void buildClockPage(lv_obj_t *page) {
   const int M = 14, G = 12;
   const int W = LCD_WIDTH - 2 * M;
 
   // ---- "Compare a time" panel
   const int topH = 98;
-  lv_obj_t *top = makePanel(scr, M, M, W, topH);
+  lv_obj_t *top = makePanel(page, M, M, W, topH);
 
   lv_obj_t *title = makeLabel(top, &lv_font_montserrat_16, C_TEXT, "Compare a time");
   lv_obj_set_pos(title, 18, 20);
 
-  offsetLabel = makeLabel(top, &lv_font_montserrat_16, lv_color_hex(0xA78BFA), "");
+  offsetLabel = makeLabel(top, &lv_font_montserrat_16, C_PURPLE_LT, "");
   lv_obj_align_to(offsetLabel, title, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
 
   resetBtn = lv_btn_create(top);
@@ -396,6 +299,7 @@ static void buildUi() {
   lv_obj_t *maxL = makeLabel(top, &lv_font_montserrat_14, C_DIM, "+12h");
   lv_obj_align(maxL, LV_ALIGN_BOTTOM_RIGHT, -18, -18);
 
+  // lv_slider clears LV_OBJ_FLAG_SCROLL_CHAIN, so dragging it never swipes the page.
   slider = lv_slider_create(top);
   lv_obj_remove_style_all(slider);
   lv_obj_set_size(slider, W - 2 * 18 - 2 * 44, 8);
@@ -424,29 +328,15 @@ static void buildUi() {
   for (int i = 0; i < 4; i++) {
     int cx = M + (i % 2) * (cw + G);
     int cy = y0 + (i / 2) * (ch + G);
-    lv_obj_t *card = makePanel(scr, cx, cy, cw, ch);
-    lv_obj_set_style_clip_corner(card, true, 0);
-
-    lv_obj_t *bar = lv_obj_create(card);
-    lv_obj_remove_style_all(bar);
-    lv_obj_set_size(bar, cw, 5);
-    lv_obj_set_pos(bar, -1, -1);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(ZONES[i].accent), 0);
-    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    lv_obj_t *card = makePanel(page, cx, cy, cw, ch);
+    makeAccentBar(card, cw, lv_color_hex(ZONES[i].accent));
 
     lv_obj_t *name = makeLabel(card, &lv_font_montserrat_18, C_TEXT, ZONES[i].name);
     lv_obj_set_pos(name, 16, 24);
 
-    cards[i].badge = lv_obj_create(card);
-    lv_obj_remove_style_all(cards[i].badge);
-    lv_obj_set_size(cards[i].badge, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_color(cards[i].badge, C_BORDER, 0);
-    lv_obj_set_style_bg_opa(cards[i].badge, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(cards[i].badge, LV_RADIUS_CIRCLE, 0);
+    cards[i].badgeLabel = makePill(card, C_BORDER, LV_OPA_COVER, &lv_font_montserrat_12, C_BADGE_TXT, &cards[i].badge);
     lv_obj_set_style_pad_hor(cards[i].badge, 9, 0);
-    lv_obj_set_style_pad_ver(cards[i].badge, 5, 0);
     lv_obj_align(cards[i].badge, LV_ALIGN_TOP_RIGHT, -12, 20);
-    cards[i].badgeLabel = makeLabel(cards[i].badge, &lv_font_montserrat_12, C_BADGE_TXT, "GMT");
 
     cards[i].time = makeLabel(card, &lv_font_montserrat_40, C_TEXT, "--:--");
     lv_obj_set_pos(cards[i].time, 14, 64);
@@ -456,6 +346,121 @@ static void buildUi() {
   }
 
   updateOffsetUi();
+}
+
+// ---------------------------------------------------------------- pages
+static void updatePageDots() {
+  lv_obj_t *act = lv_tileview_get_tile_act(tileview);
+  int idx = act ? lv_obj_get_x(act) / LCD_WIDTH : 0;
+  for (int i = 0; i < 2; i++)
+    lv_obj_set_style_bg_color(pageDots[i], i == idx ? C_MUTED : C_BORDER, 0);
+}
+
+static void onPageChanged(lv_event_t *) { updatePageDots(); }
+
+// The events page is the default page: shown at boot, after the screen sleeps, and before events.
+static void showEventsPage() {
+  lv_obj_set_tile_id(tileview, 1, 0, LV_ANIM_OFF);
+  calendarPageScrollTop();
+  updatePageDots();
+}
+
+static void buildUi() {
+  lv_obj_t *scr = lv_scr_act();
+  lv_obj_set_style_bg_color(scr, C_BG, 0);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+  tileview = lv_tileview_create(scr);
+  lv_obj_set_size(tileview, LCD_WIDTH, LCD_HEIGHT);
+  lv_obj_set_style_bg_color(tileview, C_BG, 0);
+  lv_obj_set_style_bg_opa(tileview, LV_OPA_COVER, 0);
+  lv_obj_set_scrollbar_mode(tileview, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_add_event_cb(tileview, onPageChanged, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  lv_obj_t *clockTile = lv_tileview_add_tile(tileview, 0, 0, LV_DIR_RIGHT);
+  lv_obj_t *calTile   = lv_tileview_add_tile(tileview, 1, 0, LV_DIR_LEFT);
+  lv_obj_set_scrollbar_mode(clockTile, LV_SCROLLBAR_MODE_OFF);
+
+  buildClockPage(clockTile);
+  calendarPageCreate(calTile, &ZONES[HOME_ZONE]);
+
+  // page indicator dots in the bottom margin
+  for (int i = 0; i < 2; i++) {
+    pageDots[i] = lv_obj_create(scr);
+    lv_obj_remove_style_all(pageDots[i]);
+    lv_obj_set_size(pageDots[i], 6, 6);
+    lv_obj_set_style_radius(pageDots[i], LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(pageDots[i], LV_OPA_COVER, 0);
+    lv_obj_align(pageDots[i], LV_ALIGN_BOTTOM_MID, i == 0 ? -6 : 6, -3);
+    lv_obj_clear_flag(pageDots[i], LV_OBJ_FLAG_CLICKABLE);
+  }
+  showEventsPage();
+}
+
+// ---------------------------------------------------------------- countdown / alert
+static bool cdActive = false;
+static CalEvent cdEvent;
+static char alertedId[sizeof(CalEvent::id)] = "";
+static time_t alertedStart = 0;
+static char prewokeId[sizeof(CalEvent::id)] = "";
+static time_t prewokeStart = 0;
+static bool eventSoon = false;             // within PREWAKE_SEC of the next event -> no screen timeout
+
+static void countdownTick(time_t now) {
+  eventSoon = false;
+  if (!timeValid()) return;
+
+  if (!cdActive) {
+    const CalEvent *up[1];
+    if (calendarUpcoming(calState, now, up, 1) == 1) {
+      const CalEvent &e = *up[0];
+      long left = (long)(e.start - now);
+
+      // 5 min before: wake the screen once per event and show the calendar page;
+      // keep it on until the countdown ends (the user can still swipe back to the clock).
+      if (left > 0 && left <= PREWAKE_SEC) {
+        eventSoon = true;
+        lastActivity = millis();
+        bool alreadyWoke = e.start == prewokeStart && strcmp(e.id, prewokeId) == 0;
+        if (!alreadyWoke) {
+          strcpy(prewokeId, e.id);
+          prewokeStart = e.start;
+          showEventsPage();
+          calendarPageUpdate(now, calState);
+          screenWake();
+          Serial.printf("Event \"%s\" in %ld s: screen on\n", e.title, left);
+        }
+      }
+
+      bool alreadyAlerted = e.start == alertedStart && strcmp(e.id, alertedId) == 0;
+      if (left > 0 && left <= ALERT_LEAD_SEC && !alreadyAlerted) {
+        cdActive = true;
+        cdEvent = e;
+        strcpy(alertedId, e.id);
+        alertedStart = e.start;
+        countdownShow(e.title);
+        countdownSet(left);
+        screenWake();                       // overlay is drawn before the panel lights up
+        audioPlayAlert();
+        Serial.printf("Countdown started: \"%s\" in %ld s\n", e.title, left);
+      }
+    }
+  }
+
+  if (cdActive) {
+    lastActivity = millis();                // keep the screen on during the countdown
+    long left = (long)(cdEvent.start - now);
+    if (left > 0) {
+      countdownSet(left);
+    } else {
+      cdActive = false;
+      countdownHide();
+      showEventsPage();   // show what's next
+      calendarRefreshNow();
+      Serial.println("Countdown finished");
+    }
+  }
 }
 
 // ---------------------------------------------------------------- setup / loop
@@ -473,7 +478,6 @@ void setup() {
   for (int i = 0; i < NUM_WAKE_BUTTONS; i++) {
     pinMode(WAKE_BUTTONS[i], INPUT_PULLUP);
     btnLevel[i] = digitalRead(WAKE_BUTTONS[i]);
-    Serial.printf("Button GPIO%d idle level: %s\n", WAKE_BUTTONS[i], btnLevel[i] ? "HIGH" : "LOW");
   }
 
   // Touch
@@ -493,11 +497,18 @@ void setup() {
   if (!rtcOk) Serial.println("PCF85063 not found");
   rtcToSystem();
 
+  // Speaker
+  audioBegin();
+
   // NTP (non-blocking; RTC keeps time meanwhile)
   sntp_set_time_sync_notification_cb(onNtpSync);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+
+  // Google Calendar background task
+  calendarBegin(&ZONES[HOME_ZONE]);
+  calendarGetState(&calState);
 
   // LVGL
   lv_init();
@@ -525,34 +536,43 @@ void setup() {
   esp_timer_start_periodic(tickTimer, 2000);
 
   buildUi();
+  calendarPageUpdate(time(nullptr), calState);
   lastActivity = millis();
 }
 
 void loop() {
-  static uint32_t lastUpdate = 0;
+  static uint32_t lastTick = 0;
 
-  // Screen timeout: a button press turns the screen on (or keeps it on) for another 5 minutes.
+  // Screen timeout: a button press turns the screen on (or keeps it on) for another 2 minutes.
   if (wakeButtonPressed()) screenWake();
-  if (screenOn && millis() - lastActivity >= SCREEN_TIMEOUT_MS) screenSleep();
+  if (screenOn && !cdActive && !eventSoon && millis() - lastActivity >= SCREEN_TIMEOUT_MS) screenSleep();
 
   if (ntpSynced) {
     ntpSynced = false;
     systemToRtc();
   }
 
-  if (!screenOn) {          // no drawing / panel traffic while the screen is off
-    delay(20);
-    return;
-  }
-
-  if (millis() - lastUpdate >= 250) {
-    lastUpdate = millis();
-    updateClocks();
+  if (millis() - lastTick >= 250) {
+    lastTick = millis();
+    time_t now = time(nullptr);
+    calendarGetState(&calState);
+    countdownTick(now);                     // runs even with the screen off (it wakes it)
+    if (screenOn) {
+      updateClocks();
+      calendarPageUpdate(now, calState);
+    }
     static uint32_t lastHeapLog = 0;
     if (millis() - lastHeapLog >= 30000) {
       lastHeapLog = millis();
-      Serial.printf("Free heap: %u (min %u)\n", ESP.getFreeHeap(), ESP.getMinFreeHeap());
+      Serial.printf("Free heap: %u internal / %u PSRAM (min internal %u)\n",
+                    heap_caps_get_free_size(MALLOC_CAP_INTERNAL), ESP.getFreePsram(),
+                    heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
     }
+  }
+
+  if (!screenOn) {          // no drawing / panel traffic while the screen is off
+    delay(20);
+    return;
   }
 
   lv_timer_handler();
